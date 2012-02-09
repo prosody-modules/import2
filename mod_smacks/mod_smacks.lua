@@ -7,9 +7,11 @@ local os_time = os.time;
 local tonumber, tostring = tonumber, tostring;
 local add_filter = require "util.filters".add_filter;
 local timer = require "util.timer";
+local datetime = require "util.datetime";
 
 local xmlns_sm = "urn:xmpp:sm:2";
 local xmlns_errors = "urn:ietf:params:xml:ns:xmpp-stanzas";
+local xmlns_delay = "urn:xmpp:delay";
 
 local sm_attr = { xmlns = xmlns_sm };
 
@@ -19,23 +21,38 @@ local max_unacked_stanzas = 0;
 
 local session_registry = {};
 
+local function can_do_smacks(session, advertise_only)
+	if session.smacks then return false, "unexpected-request", "Stream management is already enabled"; end
+	
+	local session_type = session.type;
+	if session_type == "c2s" then
+		if not(advertise_only) and not(session.resource) then -- Fail unless we're only advertising sm
+			return false, "unexpected-request", "Client must bind a resource before enabling stream management";
+		end
+		return true;
+	elseif s2s_smacks and (session_type == "s2sin" or session_type == "s2sout") then
+		return true;
+	end
+	return false, "service-unavailable", "Stream management is not available for this stream";
+end
+
 module:hook("stream-features",
 		function (event)
-			event.features:tag("sm", sm_attr):tag("optional"):up():up();
+			if can_do_smacks(event.origin, true) then
+				event.features:tag("sm", sm_attr):tag("optional"):up():up();
+			end
 		end);
 
 module:hook("s2s-stream-features",
 		function (event)
-			local origin = event.origin;
-			if s2s_smacks and (origin.type == "s2sin" or origin.type == "s2sout") then
+			if can_do_smacks(event.origin, true) then
 				event.features:tag("sm", sm_attr):tag("optional"):up():up();
 			end
 		end);
 
 module:hook_stanza("http://etherx.jabber.org/streams", "features",
 		function (session, stanza)
-			if s2s_smacks and (session.type == "s2sin" or session.type == "s2sout")
-					and not session.smacks and stanza:get_child("sm", xmlns_sm) then
+			if can_do_smacks(session) and stanza:get_child("sm", xmlns_sm) then
 				session.sends2s(st.stanza("enable", sm_attr));
 			end
 end);
@@ -55,7 +72,13 @@ local function wrap_session(session, resume)
 	local function new_send(stanza)
 		local attr = stanza.attr;
 		if attr and not attr.xmlns then -- Stanza in default stream namespace
-			queue[#queue+1] = st.clone(stanza);
+			local cached_stanza = st.clone(stanza);
+			
+			if cached_stanza and cached_stanza:get_child("delay", xmlns_delay) == nil then
+				cached_stanza = cached_stanza:tag("delay", { xmlns = xmlns_delay, from = session.host, stamp = datetime.datetime()});
+			end
+			
+			queue[#queue+1] = cached_stanza;
 		end
 		local ok, err = _send(stanza);
 		if ok and #queue > max_unacked_stanzas and not session.awaiting_ack then
@@ -86,6 +109,13 @@ local function wrap_session(session, resume)
 end
 
 module:hook_stanza(xmlns_sm, "enable", function (session, stanza)
+	local ok, err, err_text = can_do_smacks(session);
+	if not ok then
+		session.log("warn", "Failed to enable smacks: %s", err_text); -- TODO: XEP doesn't say we can send error text, should it?
+		session.send(st.stanza("failed", { xmlns = xmlns_sm }):tag(err, { xmlns = xmlns_errors}));
+		return true;
+	end
+
 	module:log("debug", "Enabling stream management");
 	session.smacks = true;
 	
@@ -181,10 +211,12 @@ function sessionmanager.destroy_session(session, err)
 				handle_unacked_stanzas(session);
 			end
 		else
+			session.log("debug", "mod_smacks hibernating session for up to %d seconds", resume_timeout);
 			local hibernate_time = os_time(); -- Track the time we went into hibernation
 			session.hibernating = hibernate_time;
 			local resumption_token = session.resumption_token;
 			timer.add_task(resume_timeout, function ()
+				session.log("debug", "mod_smacks hibernation timeout reached...");
 				-- We need to check the current resumption token for this resource
 				-- matches the smacks session this timer is for in case it changed
 				-- (for example, the client may have bound a new resource and
@@ -194,11 +226,14 @@ function sessionmanager.destroy_session(session, err)
 				-- Check the hibernate time still matches what we think it is,
 				-- otherwise the session resumed and re-hibernated.
 				and session.hibernating == hibernate_time then
+					session.log("debug", "Destroying session for hibernating too long");
 					session_registry[session.resumption_token] = nil;
 					session.resumption_token = nil;
 					-- This recursion back into our destroy handler is to
 					-- make sure we still handle any queued stanzas
 					sessionmanager.destroy_session(session);
+				else
+					session.log("debug", "Session resumed before hibernation timeout, all is well")
 				end
 			end);
 			return; -- Postpone destruction for now
@@ -212,11 +247,13 @@ module:hook_stanza(xmlns_sm, "resume", function (session, stanza)
 	local id = stanza.attr.previd;
 	local original_session = session_registry[id];
 	if not original_session then
+		session.log("debug", "Tried to resume non-existent session with id %s", id);
 		session.send(st.stanza("failed", sm_attr)
 			:tag("item-not-found", { xmlns = xmlns_errors })
 		);
 	elseif session.username == original_session.username
 	and session.host == original_session.host then
+		session.log("debug", "mod_smacks resuming existing session...");
 		-- TODO: All this should move to sessionmanager (e.g. session:replace(new_session))
 		original_session.ip = session.ip;
 		original_session.conn = session.conn;
